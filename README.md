@@ -79,3 +79,33 @@ TF_LOG=INFO go test -v ./postgresql -run ^TestAccPostgresqlRole_Basic$
 # cleans the env and tears down the postgres container
 make testacc_cleanup 
 ```
+
+Colocated database 
+```
+cat providers.tf
+terraform {
+  required_providers {
+    postgresql = {
+      source  = "local/postgresql"
+      version = "99.0.0"
+    }
+  }
+}
+
+provider "postgresql" {
+  host            = "localhost"
+  port            = 5433
+  username        = "yugabyte"
+  password        = "yugabyte"
+  sslmode         = "disable"
+  expected_version = "11.2"
+}
+```
+
+```
+cat main.tf
+resource "postgresql_database" "colocated_db" {
+  name       = "my_colocated_db2"
+  colocation = true
+}
+```
