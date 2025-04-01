@@ -25,6 +25,7 @@ const (
 	dbTablespaceAttr       = "tablespace_name"
 	dbTemplateAttr         = "template"
 	dbAlterObjectOwnership = "alter_object_ownership"
+	dbColocationAttr       = "colocation"
 )
 
 func resourcePostgreSQLDatabase() *schema.Resource {
@@ -109,6 +110,12 @@ func resourcePostgreSQLDatabase() *schema.Resource {
 				Default:     false,
 				Description: "If true, the owner of already existing objects will change if the owner changes",
 			},
+			dbColocationAttr: {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "Specifies whether colocation is enabled for the database",
+			},
 		},
 	}
 }
@@ -127,10 +134,7 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	currentUser := db.client.config.getDatabaseUsername()
 	owner := d.Get(dbOwnerAttr).(string)
 
-	var err error
 	if owner != "" {
-		// Take a lock on db currentUser to avoid multiple database creation at the same time
-		// It can fail if they grant the same owner to current at the same time as it's not done in transaction.
 		lockTxn, err := startTransaction(db.client, "")
 		if err != nil {
 			return err
@@ -140,15 +144,13 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 		}
 		defer deferredRollback(lockTxn)
 
-		// Needed in order to set the owner of the db if the connection user is not a
-		// superuser
 		ownerGranted, err := grantRoleMembership(db, owner, currentUser)
 		if err != nil {
 			return err
 		}
 		if ownerGranted {
 			defer func() {
-				_, err = revokeRoleMembership(db, owner, currentUser)
+				_, _ = revokeRoleMembership(db, owner, currentUser)
 			}()
 		}
 	}
@@ -157,57 +159,38 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 	b := bytes.NewBufferString("CREATE DATABASE ")
 	fmt.Fprint(b, pq.QuoteIdentifier(dbName))
 
-	// Handle each option individually and stream results into the query
-	// buffer.
+	if v, ok := d.GetOk(dbColocationAttr); ok && v.(bool) {
+		fmt.Fprint(b, " WITH COLOCATION = true")
+	}
+
 	switch v, ok := d.GetOk(dbOwnerAttr); {
 	case ok:
 		fmt.Fprint(b, " OWNER ", pq.QuoteIdentifier(v.(string)))
 	default:
-		// No owner specified in the config, default to using
-		// the connecting username.
 		fmt.Fprint(b, " OWNER ", pq.QuoteIdentifier(currentUser))
 	}
 
-	switch v, ok := d.GetOk(dbTemplateAttr); {
-	case ok && strings.ToUpper(v.(string)) == "DEFAULT":
-		fmt.Fprint(b, " TEMPLATE DEFAULT")
-	case ok:
+	if v, ok := d.GetOk(dbTemplateAttr); ok && v.(string) != "" {
 		fmt.Fprint(b, " TEMPLATE ", pq.QuoteIdentifier(v.(string)))
-	case v.(string) == "":
+	} else {
 		fmt.Fprint(b, " TEMPLATE template0")
 	}
 
-	switch v, ok := d.GetOk(dbEncodingAttr); {
-	case ok && strings.ToUpper(v.(string)) == "DEFAULT":
-		fmt.Fprintf(b, " ENCODING DEFAULT")
-	case ok:
-		fmt.Fprintf(b, " ENCODING '%s' ", pqQuoteLiteral(v.(string)))
-	case v.(string) == "":
+	if v, ok := d.GetOk(dbEncodingAttr); ok && v.(string) != "" {
+		fmt.Fprintf(b, " ENCODING '%s'", pqQuoteLiteral(v.(string)))
+	} else {
 		fmt.Fprint(b, ` ENCODING 'UTF8'`)
 	}
 
-	// Don't specify LC_COLLATE if user didn't specify it
-	// This will use the default one (usually the one defined in the template database)
-	switch v, ok := d.GetOk(dbCollationAttr); {
-	case ok && strings.ToUpper(v.(string)) == "DEFAULT":
-		fmt.Fprintf(b, " LC_COLLATE DEFAULT")
-	case ok:
-		fmt.Fprintf(b, " LC_COLLATE '%s' ", pqQuoteLiteral(v.(string)))
+	if v, ok := d.GetOk(dbCollationAttr); ok && v.(string) != "" {
+		fmt.Fprintf(b, " LC_COLLATE '%s'", pqQuoteLiteral(v.(string)))
 	}
 
-	// Don't specify LC_CTYPE if user didn't specify it
-	// This will use the default one (usually the one defined in the template database)
-	switch v, ok := d.GetOk(dbCTypeAttr); {
-	case ok && strings.ToUpper(v.(string)) == "DEFAULT":
-		fmt.Fprintf(b, " LC_CTYPE DEFAULT")
-	case ok:
-		fmt.Fprintf(b, " LC_CTYPE '%s' ", pqQuoteLiteral(v.(string)))
+	if v, ok := d.GetOk(dbCTypeAttr); ok && v.(string) != "" {
+		fmt.Fprintf(b, " LC_CTYPE '%s'", pqQuoteLiteral(v.(string)))
 	}
 
-	switch v, ok := d.GetOk(dbTablespaceAttr); {
-	case ok && strings.ToUpper(v.(string)) == "DEFAULT":
-		fmt.Fprint(b, " TABLESPACE DEFAULT")
-	case ok:
+	if v, ok := d.GetOk(dbTablespaceAttr); ok && v.(string) != "" {
 		fmt.Fprint(b, " TABLESPACE ", pq.QuoteIdentifier(v.(string)))
 	}
 
@@ -216,10 +199,8 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 		fmt.Fprint(b, " ALLOW_CONNECTIONS ", val)
 	}
 
-	{
-		val := d.Get(dbConnLimitAttr).(int)
-		fmt.Fprint(b, " CONNECTION LIMIT ", val)
-	}
+	val := d.Get(dbConnLimitAttr).(int)
+	fmt.Fprint(b, " CONNECTION LIMIT ", val)
 
 	if db.featureSupported(featureDBIsTemplate) {
 		val := d.Get(dbIsTemplateAttr).(bool)
@@ -231,9 +212,7 @@ func createDatabase(db *DBConnection, d *schema.ResourceData) error {
 		return fmt.Errorf("Error creating database %q: %w", dbName, err)
 	}
 
-	// Set err outside of the return so that the deferred revoke can override err
-	// if necessary.
-	return err
+	return nil
 }
 
 func resourcePostgreSQLDatabaseDelete(db *DBConnection, d *schema.ResourceData) error {
